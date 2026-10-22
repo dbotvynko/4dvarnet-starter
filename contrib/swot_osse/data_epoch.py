@@ -65,7 +65,11 @@ class SwotErrorsOSSE:
     """
 
     def __init__(self, path, masks_path, domain, calibration, variables="sla", swot_dropout=0.5, nadir_noise_m=0.01,
-                 scale_buckets_deg=(1.0, 1.5, 2.0), n_pool=48, test_cut=None):
+                 scale_buckets_deg=(1.0, 1.5, 2.0), n_pool=48, test_cut=None, sequence="random", dropout_block_days=1):
+        """sequence: "random" (default, as trained on 14 Oct 2026): each record day takes the masks of a random 2024 day;
+        "orbit": record day t takes the masks of 2024 day (t + offset) mod 366, offset drawn once per draw, so every window
+        has the real space-time sampling of the science orbit (21-day repeat, neighbouring swaths on consecutive days).
+        dropout_block_days: SWOT is dropped on whole blocks of this many consecutive days (1: day by day)."""
         print("LOADING GLORYS SLA truth (SWOT OSSE with calibrated, re-drawn errors)")
         ds = xr.open_dataset(path)
         if "latitude" in ds.dims:
@@ -81,6 +85,8 @@ class SwotErrorsOSSE:
         self.data = data
         self.shape = shape
         self.swot_dropout, self.nadir_noise_m, self.n_pool = swot_dropout, nadir_noise_m, n_pool
+        assert sequence in ("random", "orbit"), sequence
+        self.sequence, self.dropout_block_days = sequence, int(dropout_block_days)
         self.buckets = np.array(scale_buckets_deg, dtype=float)
         lat = ds["lat"].values
         white, corr, scale, self.table = calibrated_profiles(calibration, lat, self.buckets[0], self.buckets[-1])
@@ -114,9 +120,19 @@ class SwotErrorsOSSE:
         n_lon = self.shape[1]
         n_dropped = 0
         self.last_draw = []  # (time index, 2024 mask day, SWOT dropped) of this draw, for checks
+        n_days = self.nadir.shape[0]
+        block = self.dropout_block_days
+        # extra draws only for the non-default options, so the default ("random", day-by-day dropout) keeps its RNG stream
+        offset = int(rng.integers(n_days)) if self.sequence == "orbit" else 0
+        if block > 1:
+            block_shift = int(rng.integers(block))
+            block_drop = rng.random(int(np.max(time_index)) // block + 2) < self.swot_dropout
         for t in time_index:
-            day = int(rng.integers(0, self.nadir.shape[0]))
-            drop = rng.random() < self.swot_dropout
+            if self.sequence == "orbit":
+                day = int((t + offset) % n_days)
+            else:
+                day = int(rng.integers(0, n_days))
+            drop = bool(block_drop[(t + block_shift) // block]) if block > 1 else rng.random() < self.swot_dropout
             n_dropped += drop
             self.last_draw.append((t, day, drop))
             (nr, nc), (sr, sc) = self._pixels(day)
