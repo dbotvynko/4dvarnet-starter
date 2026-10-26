@@ -1,0 +1,128 @@
+# @package _global_
+# Fine-tuning of the OSE SLA UNet trained on 2017-2022 with the DUACS losses (val_mse=0.01999-epoch=151, the best UNet with
+# nadir input on 2024) with synthetic SWOT swaths (contrib/swot_osse/ose_swot_finetune.py):
+# - same data as its training: real nadir L3 input, DUACS target, train 2017-01-01 -> 2022-04-17, val -> 2022-11-30;
+#   the nadir file of August 2025 (2010_2023/gridded/gridded_input.nc) no longer exists: MY L3 gridded_input_4th.nc,
+#   sla_filtered (the variable of the 2023 and 2024 inputs);
+# - SWOT swaths = DUACS + error model calibrated on the real 2024 swaths, on the swath pixels of random 2024 days, absent on
+#   half the days; errors, sampling days and SWOT-free days re-drawn every 10 epochs, validation drawn once;
+# - same loss (50 * (MSE + coarse + gradient + DoG), as in August 2025), model, UNet, patch and batch;
+# - gentle fine-tune: weights only (fresh Adam), lr 1e-4 cosine over 100 epochs (the SWOT-error fine-tune of the OSSE UNet
+#   at 3e-4 over 300 epochs drifted away from its nadir skill);
+# - norm_stats: the values the August 2025 training used ("Norm stats" in job_11377 / job_11438_SLA_real_data.log, also
+#   val_mse / (50 val_loss) = std^2 in its metrics.csv). Recomputed now on duacs_2017_2022_0.25deg.nc the mean is the same
+#   and the std is 0.0954 (the 2025 value is low, likely float32 accumulation); the network was trained with 0.0645.
+# The launcher overrides paths.glorys12_data / paths.nadir_data with node-local /SCRATCH copies.
+
+paths:
+  glorys12_data: /Odyssey/public/duacs/2023/duacs_2017_2022_0.25deg.nc
+  nadir_data: /Odyssey/public/altimetry_traces/processed/2010_2023/gridded/gridded_input_4th.nc
+  masks_path: /Odyssey/public/swot_traces/mask/cls_2024_nadir_swot_masks.npz
+  calibration: contrib/swot_osse/swot_errors_2024_calibrated.yaml
+  init_ckpt: /Odyssey/public/glorys/trainings/forecast_global_1patch_2017_2022_SLA_UNet_ResBlock_real_data_Nadir_Duacs_losses/base_forecast_global_softedge_fastrec_GPU_1patch_10y_SLA_UNet_real_data_from_sratch/checkpoints/val_mse=0.01999-epoch=151.ckpt
+
+domain:
+  train:
+    lat: {_target_: builtins.slice, _args_: [-80, 90]}
+    lon: {_target_: builtins.slice, _args_: [-180, 180]}
+  test:
+    lat: {_target_: builtins.slice, _args_: [-79, 89]}
+    lon: {_target_: builtins.slice, _args_: [-179, 179]}
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  inference_mode: False
+  gradient_clip_val: 0.5
+  accelerator: gpu
+  devices: 1
+  reload_dataloaders_every_n_epochs: ${datamodule.resample_every}
+  logger:
+    _target_: pytorch_lightning.loggers.CSVLogger
+    save_dir: /Odyssey/public/glorys/trainings/forecast_SLA_UNet_OSE_2017_2022_SWOT_errors_finetune
+    name: ${hydra:runtime.choices.xp}
+    version: ''
+  max_epochs: 100
+  limit_train_batches: 100
+  callbacks:
+    - _target_: src.versioning_cb.VersioningCallback
+    - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+      monitor: val_mse
+      save_top_k: 3
+      save_last: True
+      filename: '{val_mse:.5f}-{epoch:03d}'
+
+datamodule:
+  _target_: contrib.swot_osse.ose_swot_finetune.OseSwotErrorsMovingPatchDataModule
+  norm_stats: [0.07341718673706055, 0.06454061716794968]  # see header
+  ose_kw:
+    path: ${paths.glorys12_data}
+    nadir_path: ${paths.nadir_data}
+    masks_path: ${paths.masks_path}
+    calibration: ${paths.calibration}
+    domain: ${domain.train}
+    variables: sla
+    nadir_variable: sla_filtered
+    swot_dropout: 0.5
+    scale_buckets_deg: [1.0, 1.5, 2.0]
+    n_pool: 48
+    time_range: ['2017-01-01', '2022-12-31']
+  resample_every: 10
+  val_seed: 0
+  domains:
+    train:
+      time: {_target_: builtins.slice, _args_: ['2017-01-01', '2022-04-17']}
+    val:
+      time: {_target_: builtins.slice, _args_: ['2022-04-18', '2022-11-30']}
+    test:
+      time: {_target_: builtins.slice, _args_: ['2022-12-31', '2022-12-31']}
+  xrds_kw:
+    patch_dims: {time: 29, lat: 680, lon: 1440}
+    strides: {time: 1, lat: 672, lon: 1432}
+    domain_limits: ${domain.train}
+  dl_kw: {batch_size: 1, num_workers: 12}
+  aug_kw: null
+
+model:
+  _target_: contrib.swot_osse.ose_swot_finetune.Plus4dVarNetForecastPatchGPU_UNet_DuacsLosses
+  persist_rw: False
+  opt_fn:
+    _target_: src.utils.cosanneal_lr_adam_UNet
+    _partial_: true
+    lr: 1e-4
+    T_max: ${trainer.max_epochs}
+  rec_weight:
+    _target_: src.utils.get_forecast_wei
+    patch_dims: ${datamodule.xrds_kw.patch_dims}
+    crop: {time: 0, lat: 4, lon: 4}
+  rec_weight_fn:
+    _target_: contrib.forecast_weights.forecast_weights_reconstruction_soft_edges
+    _partial_: True
+    soft_edge: 0.25
+  solver:
+    _target_: src.models_UNet.UNet
+    n_channels: 29
+    n_classes: 29
+    bilinear: True
+    block:
+      _target_: src.parts.ResBlock
+      _partial_: True
+    add_input: False
+  pre_metric_fn:
+    _target_: xarray.Dataset.sel
+    _partial_: True
+    time: {_target_: builtins.slice, _args_: ["2022-11-01", "2022-11-30"]}
+    lat: ${domain.test.lat}
+    lon: ${domain.test.lon}
+
+entrypoints:
+  - _target_: pytorch_lightning.seed_everything
+    seed: 333
+  - _target_: contrib.swot_osse.train.finetune_from_weights
+    trainer: ${trainer}
+    dm: ${datamodule}
+    lit_mod: ${model}
+    init_ckpt: ${paths.init_ckpt}
+
+defaults:
+  - _self_
