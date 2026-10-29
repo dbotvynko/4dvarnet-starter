@@ -36,13 +36,13 @@ CKPTS = {"nadir": None,
          "1day_orbit": "/Odyssey/public/glorys/trainings/forecast_SLA_UNet_OSSE_SWOT_1day_orbit/*/checkpoints/val_mse=*.ckpt"}
 LABELS = {"nadir": "Nadir-trained UNet", "swotscratch": "UNet trained with SWOT errors (2024 orbit)", "1day_orbit": "UNet trained on the 1-day orbit"}
 CENTER = (35.5, -74.0)
-BOX = (31.0, 40.0, -79.0, -68.0)  # lat_min, lat_max, lon_min, lon_max
+BOX = (31.0, 40.0, -78.0, -69.5)  # lat_min, lat_max, lon_min, lon_max
 MASK = "/Odyssey/private/d21botvy/oceanbench_eval/results/swot_denial_crossover/crossover_mask.npz"
 SHOWN = [("strip_xover", "crossover", "#d62728"), ("strip_0_150", "swath < 150 km", "#2a78d6"), ("strip_150_300", "swath 150–300 km", "#8fb8ea"),
          ("off_0_150", "off swath < 150 km", "#b9b8b3")]
 CASES = [("nadir", "Nadir only"), ("t0m1", "Nadir + SWOT on t0−1 only"), ("all", "Nadir + SWOT on all 14 days")]
 CASE_COLORS = {"nadir": "#52514e", "t0m1": "#2a78d6", "all": "#eb6834"}
-SLA_KW = dict(cmap="RdBu_r", vmin=-0.8, vmax=0.8)
+SLA_KW = dict(cmap="RdBu_r", vmin=-0.4, vmax=0.4)
 ERR_KW = dict(cmap="PuOr_r", vmin=-0.25, vmax=0.25)
 
 
@@ -142,8 +142,8 @@ def main():
 
     # figure
     proj = ccrs.PlateCarree()
-    fig = plt.figure(figsize=(16, 13.5), layout="constrained")
-    gs = fig.add_gridspec(3, 4)
+    fig = plt.figure(figsize=(18, 19), layout="constrained")
+    gs = fig.add_gridspec(4, 4, height_ratios=[1, 1, 1, 0.8])
     land = cfeature.NaturalEarthFeature("physical", "land", "50m", facecolor="#d9d8d4", edgecolor="#52514e", linewidth=0.4)
 
     def zoom(r, c, title):
@@ -186,11 +186,15 @@ def main():
     fig.colorbar(im, ax=ax, shrink=0.75, label="SLA (m)")
 
     # row 2: day-1 forecasts and the SWOT imprint
+    dy, dx = np.where(np.isfinite(truth))
+    keep = (dy % 2 == 0) & (dx % 2 == 0)
+    dot_lat, dot_lon, dot_val = blat[dy[keep]], blon[dx[keep]], truth[dy[keep], dx[keep]]
     for c, (case, label) in enumerate(CASES):
-        ax = zoom(1, c, f"({'efg'[c]}) Day-1 forecast\n{label}")
+        ax = zoom(1, c, f"({'efg'[c]}) Forecast, {label.replace('Nadir + ', '')}\ndots: SWOT observed {t0:%d %b}")
         im = ax.pcolormesh(blon, blat, fc[case], transform=proj, **SLA_KW)
-        ax.plot(t_lon, t_lat, ".", ms=1, color="k", transform=proj, zorder=5)
-    fig.colorbar(im, ax=ax, shrink=0.8, label="SLA (m)")
+        # the SWOT truth of the valid day as dots on the same colour scale (every second cell): a dot that blends in = forecast right
+        ax.scatter(dot_lon, dot_lat, c=dot_val, s=22, edgecolors="k", linewidths=0.4, transform=proj, zorder=5, **SLA_KW)
+    fig.colorbar(im, ax=ax, shrink=0.8, label="SLA (m)", extend="both")
     ax = zoom(1, 3, "(h) SWOT imprint:\n(f) − (e)")
     im = ax.pcolormesh(blon, blat, fc["t0m1"] - fc["nadir"], transform=proj, **ERR_KW)
     fig.colorbar(im, ax=ax, shrink=0.8, label="m")
@@ -202,7 +206,7 @@ def main():
         ax = zoom(2, c, f"({'ijk'[c]}) ({'efg'[c]}) − SWOT; RMSE (cm):\ncrossover {r[0].rmse_swot_cm:.1f}, swath <150 km {r[1].rmse_swot_cm:.1f}")
         im = ax.pcolormesh(blon, blat, fc[case] - truth, transform=proj, **ERR_KW)
     fig.colorbar(im, ax=ax, shrink=0.8, label="forecast − SWOT (m)")
-    ax = fig.add_subplot(gs[2, 3])
+    ax = fig.add_subplot(gs[3, :2])
     ax.plot(t_lat[order], t_val[order], "k-", lw=1.8, label="AltiKa (truth)")
     for case, label in CASES:
         v = fc[case][gi, gj]
@@ -215,7 +219,25 @@ def main():
     ax.set_ylabel("SLA (m)")
     ax.grid(color="#e4e3df", lw=0.6)
     ax.legend(fontsize=7, loc="upper right")
-    ax.set_title(f"(l) Along the AltiKa track, {t0:%d %b}\n(never an input)", loc="left", fontsize=9.5, fontweight="bold")
+    ax.set_title(f"(l) Along the AltiKa track, {t0:%d %b} (never an input)", loc="left", fontsize=9.5, fontweight="bold")
+
+    # SWOT truth of the valid day against the forecasts along the swath: mean across the swath per latitude, on the SWOT cells
+    ax = fig.add_subplot(gs[3, 2:])
+    ok = np.isfinite(truth)
+    rows_ok = ok.sum(1) >= 3
+    mean_row = lambda a: np.where(rows_ok, np.nansum(np.where(ok, a, 0), 1) / np.maximum(ok.sum(1), 1), np.nan)  # noqa: E731
+    ax.plot(blat, mean_row(truth), "k-", lw=1.8, label="SWOT (truth)")
+    for case, label in CASES:
+        rm = 100 * np.sqrt(np.mean((fc[case] - truth)[ok] ** 2))
+        ax.plot(blat, mean_row(fc[case]), "-", color=CASE_COLORS[case], lw=1.4, label=f"{label} · RMSE {rm:.1f} cm (all SWOT cells)")
+    xo_rows = blat[(cls == CLASSES.index("strip_xover")).any(1)]
+    if xo_rows.size:
+        ax.axvspan(xo_rows.min(), xo_rows.max(), color="#d62728", alpha=0.12, lw=0, label="crossover latitudes")
+    ax.set_xlabel("latitude (°N)")
+    ax.set_ylabel("SLA (m), mean across the swath")
+    ax.grid(color="#e4e3df", lw=0.6)
+    ax.legend(fontsize=7, loc="upper right")
+    ax.set_title(f"(m) Along the SWOT swath, {t0:%d %b}: SWOT vs day-1 forecasts", loc="left", fontsize=9.5, fontweight="bold")
 
     fig.suptitle(f"One crossover of the SWOT 1-day orbit, off Cape Hatteras · {LABELS[args.model]}\nStart t0 = {t0:%d %b %Y}, lead day 1. "
                  "Black contour: crossover cells; black line: AltiKa track", x=0.01, ha="left", fontsize=11, fontweight="bold")
