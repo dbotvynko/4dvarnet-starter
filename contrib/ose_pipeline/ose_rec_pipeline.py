@@ -70,6 +70,10 @@ def setup_model_config(
         rec_paths,
         dT = dict(config)['datamodule']['xrds_kw']['patch_dims']['time'],
     )
+    # optional model-config key `ose_output_leadtime_start`: first window day written, relative to the first forecast day
+    # (-1 also writes test_data_13 = reconstruction of the last observed day); default unchanged (0 = first forecast day)
+    if config.get('ose_output_leadtime_start') is not None:
+        leadtime_start = int(config['ose_output_leadtime_start'])
     OmegaConf.update(config, key='model.output_leadtime_start', value=leadtime_start)
 
     return config
