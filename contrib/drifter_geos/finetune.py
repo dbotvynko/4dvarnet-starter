@@ -30,10 +30,21 @@ TrainingItemOSE = namedtuple("TrainingItemOSE", ["input", "input_complete", "tgt
 G, OMEGA, M_PER_DEG = 9.81, 7.2921e-5, 111.0e3
 
 
-def open_duacs_tgt_l3_input(path, real_traces, domain, var_tgt="sla", var_input="sla"):
+def open_duacs_tgt_l3_input(path, real_traces, domain, var_tgt="sla", var_input="sla", tgt_files=None):
     """Like contrib.data_loading.data.open_glorys12_data_sla_OSE but opens only the SLA of the (55 GB, 6-variable) DUACS
-    file: input = input_complete = gridded L3, tgt = DUACS SLA. Returns a DataArray (variable, time, lat, lon)."""
+    file: input = input_complete = gridded L3, tgt = DUACS SLA. Returns a DataArray (variable, time, lat, lon).
+    tgt_files: optional glob of files on the same grid (e.g. NeurOST, contrib/neurost_regional/download_neurost_nepac.py)
+    that replace the DUACS target; the DUACS file then only gives the grid and the time axis."""
     tgt = xr.open_dataset(path)[var_tgt]
+    if tgt_files:
+        import glob
+        alt = xr.concat([xr.open_dataset(f)[var_tgt].load() for f in sorted(glob.glob(tgt_files))], "time")
+        if "latitude" in tgt.dims:
+            tgt = tgt.rename({"latitude": "lat", "longitude": "lon"})
+        ref = tgt.sel(domain)
+        tgt = alt.sel(lat=ref.lat, lon=ref.lon, method="nearest").assign_coords(lat=ref.lat.values, lon=ref.lon.values)
+        tgt = tgt.reindex(time=ref.time)
+        print(f"target replaced by {tgt_files}: {int(np.isfinite(tgt.isel(lat=len(ref.lat) // 2, lon=len(ref.lon) // 2)).sum())} valid days")
     inp = xr.open_dataset(real_traces)[var_input]
     if "latitude" in tgt.dims:
         tgt = tgt.rename({"latitude": "lat", "longitude": "lon"})
@@ -76,13 +87,14 @@ class GeosDataModule(MovingPatchDataModuleFastRecGPU):
 class GeosDrifterFineTune(Plus4dVarNetForecastPatchGPU_UNet):
     def __init__(self, *args, init_ckpt=None, mdt_path=None, drifter_dir=None, drifter_years=(2017, 2018, 2019, 2020, 2021, 2022),
                  w_sla=1.0, w_geos=1.0, w_drift=1.0, vel_scale=0.1, huber_delta=2.0, lead_days=(14, 15, 16, 17, 18, 19, 20),
-                 lat_band=(5.0, 75.0), **kwargs):
+                 lat_band=(5.0, 75.0), periodic_lon=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.w_sla, self.w_geos, self.w_drift = w_sla, w_geos, w_drift
         self.vel_scale, self.huber_delta = vel_scale, huber_delta      # velocities divided by vel_scale (m/s) in the losses
         self.lead_days, self.lat_band = list(lead_days), lat_band
         self.mdt_path, self.drifter_dir, self.drifter_years = mdt_path, drifter_dir, list(drifter_years)
         self._grid_ready = False
+        self.periodic_lon = periodic_lon        # False for a regional domain: no wrap-around in longitude
         if init_ckpt:
             sd = torch.load(init_ckpt, map_location="cpu")["state_dict"]
             missing, unexpected = self.load_state_dict(sd, strict=False)
@@ -128,17 +140,23 @@ class GeosDrifterFineTune(Plus4dVarNetForecastPatchGPU_UNet):
         """h (..., lat, lon) in m -> u, v (m/s), centred differences, longitude periodic; 0 outside the latitude band."""
         dhdi = torch.zeros_like(h)
         dhdi[..., 1:-1, :] = (h[..., 2:, :] - h[..., :-2, :]) / 2
-        dhdj = (torch.roll(h, -1, -1) - torch.roll(h, 1, -1)) / 2
+        if self.periodic_lon:
+            dhdj = (torch.roll(h, -1, -1) - torch.roll(h, 1, -1)) / 2
+        else:
+            dhdj = torch.zeros_like(h)
+            dhdj[..., 1:-1] = (h[..., 2:] - h[..., :-2]) / 2
         return self._fy * dhdi, self._fx * dhdj
 
-    @staticmethod
-    def _valid_stencil(finite):
+    def _valid_stencil(self, finite):
         """point and its 4 neighbours finite (centred differences meaningful)"""
         v = finite.clone()
         v[..., 1:-1, :] &= finite[..., 2:, :] & finite[..., :-2, :]
         v[..., 0, :] = False
         v[..., -1, :] = False
         v &= torch.roll(finite, 1, -1) & torch.roll(finite, -1, -1)
+        if not self.periodic_lon:
+            v[..., 0] = False
+            v[..., -1] = False
         return v
 
     # ---------------------------------------------------------------- losses
@@ -183,6 +201,8 @@ class GeosDrifterFineTune(Plus4dVarNetForecastPatchGPU_UNet):
                 r, c, u, v = self._drift[key].to(out.device)
                 r0, c0 = torch.floor(r).long(), torch.floor(c).long()
                 keep = (r0 >= 0) & (r0 < ua.shape[-2] - 1)
+                if not self.periodic_lon:
+                    keep &= (c0 >= 0) & (c0 < ua.shape[-1] - 1)
                 r, c, u, v, r0, c0 = r[keep], c[keep], u[keep], v[keep], r0[keep], c0[keep]
                 wr, wc = r - r0, c - c0
                 c1 = (c0 + 1) % ua.shape[-1]
