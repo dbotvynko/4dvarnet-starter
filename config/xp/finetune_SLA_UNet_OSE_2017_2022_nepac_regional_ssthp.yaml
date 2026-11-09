@@ -1,0 +1,122 @@
+# @package _global_
+# v2: SST HIGH-PASS FILTERED (minus Gaussian smoothing, sigma 1 deg; contrib.sst_regional.sst_finetune.highpass_sst).
+# Regional NE Pacific fine-tune WITH SST INPUT (contrib/sst_regional/sst_finetune.py): identical to
+# finetune_SLA_UNet_OSE_2017_2022_nepac_regional.yaml (same init checkpoint, losses, weights, epochs, checkpoint selection)
+# plus MUR25 SST (29 extra input channels, masked from t0 like the altimetry; first-layer SST weights start at 0).
+# Control = regional run "duacs" of that config. Usage: sbatch scripts/sst_regional/finetune_nepac_sst.sh duacs
+run_name: duacs
+paths:
+  duacs: /Odyssey/public/duacs/2023/duacs_2017_2022_0.25deg.nc
+  real_traces: /Odyssey/public/altimetry_traces/2010_2023/gridded/gridded_input_2017_2022_rebuilt.nc
+  init_ckpt: /Odyssey/public/glorys/trainings/forecast_global_1patch_2017_2022_SLA_UNet_ResBlock_real_data_Nadir_Duacs_losses/base_forecast_global_softedge_fastrec_GPU_1patch_10y_SLA_UNet_real_data_from_sratch/checkpoints/val_mse=0.01999-epoch=151.ckpt
+  mdt: /Odyssey/public/duacs/cnes_obs-sl_glo_phy-mdt_my_0.125deg_P20Y_multi-vars_179.94W-179.94E_89.94S-89.94N_2003-01-01.nc
+  drifters: /Odyssey/private/d21botvy/DATA/drifters_geos
+  neurost: /Odyssey/private/d21botvy/DATA/neurost_nepac/neurost_sla_0.25deg_nepac_*.nc
+  sst: /Odyssey/private/d21botvy/DATA/mur25_nepac/mur25_sst_0.25deg_nepac_*.nc
+  out_dir: /Odyssey/public/glorys/trainings/forecast_nepac_2017_2022_SLA_UNet_regional_finetune_ssthp/${run_name}
+
+domain:
+  train:
+    lat: {_target_: builtins.slice, _args_: [10, 54.9]}
+    lon: {_target_: builtins.slice, _args_: [-170, -115.1]}
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  inference_mode: False
+  gradient_clip_val: 0.5
+  accelerator: gpu
+  devices: 1
+  logger:
+    _target_: pytorch_lightning.loggers.CSVLogger
+    save_dir: ${paths.out_dir}
+    name: logs
+    version: ''
+  max_epochs: 30
+  callbacks:
+    - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+      dirpath: ${paths.out_dir}/checkpoints
+      monitor: val_drift_rmse_cms
+      save_top_k: 3
+      save_last: True
+      filename: 'drift={val_drift_rmse_cms:.3f}-geos={val_geos_rmse_cms:.2f}-mse={val_mse:.5f}-{epoch:03d}'
+      auto_insert_metric_name: False
+
+datamodule:
+  _target_: contrib.sst_regional.sst_finetune.GeosDataModuleSST
+  norm_stats: [0.06845433863679029, 0.08884555472093428]
+  sst_stats: [-0.0024426, 0.2624939]     # high-passed MUR25 mean, std (deg C), training period 2017-01-01..2022-04-17
+  input_da:
+    _target_: contrib.sst_regional.sst_finetune.open_tgt_l3_sst_input
+    sst_files: ${paths.sst}
+    sst_highpass_deg: 1.0
+    path: ${paths.duacs}
+    real_traces: ${paths.real_traces}
+    domain: ${domain.train}
+    tgt_files: null
+  domains:
+    train:
+      time: {_target_: builtins.slice, _args_: ['2017-01-01', '2022-04-17']}
+    val:
+      time: {_target_: builtins.slice, _args_: ['2022-04-18', '2022-11-30']}
+    test:
+      time: {_target_: builtins.slice, _args_: ['2022-12-01', '2022-12-31']}
+  xrds_kw:
+    patch_dims: {time: 29, lat: 180, lon: 220}
+    strides: {time: 1, lat: 180, lon: 220}
+    domain_limits: ${domain.train}
+  dl_kw: {batch_size: 4, num_workers: 4}
+  aug_kw: null
+
+model:
+  _target_: contrib.sst_regional.sst_finetune.GeosDrifterFineTuneSST
+  init_ckpt: ${paths.init_ckpt}
+  mdt_path: ${paths.mdt}
+  drifter_dir: ${paths.drifters}
+  drifter_years: [2017, 2018, 2019, 2020, 2021, 2022]
+  periodic_lon: False
+  w_sla: 1.0
+  w_geos: 4.372309094047361     # same weights as the global velocity fine-tune (loss_weights.json)
+  w_drift: 7.2388823821241015
+  vel_scale: 0.1
+  huber_delta: 2.0
+  lead_days: [14, 15, 16, 17, 18, 19, 20]
+  lat_band: [5.0, 75.0]
+  persist_rw: False
+  opt_fn:
+    _target_: src.utils.cosanneal_lr_adam_UNet
+    _partial_: true
+    lr: 1e-4
+    T_max: ${trainer.max_epochs}
+  rec_weight:
+    _target_: src.utils.get_forecast_wei
+    patch_dims: ${datamodule.xrds_kw.patch_dims}
+    crop: {time: 0, lat: 4, lon: 4}
+  rec_weight_fn:
+    _target_: contrib.forecast_weights.forecast_weights_reconstruction_soft_edges
+    _partial_: True
+    soft_edge: 0.25
+  solver:
+    _target_: contrib.sst_regional.sst_finetune.UNetSST
+    n_channels: 29
+    n_classes: 29
+    bilinear: True
+    block:
+      _target_: src.parts.ResBlock
+      _partial_: True
+    add_input: False
+  pre_metric_fn:
+    _target_: xarray.Dataset.sel
+    _partial_: True
+    time: {_target_: builtins.slice, _args_: ["2022-12-01", "2022-12-31"]}
+
+entrypoints:
+  - _target_: pytorch_lightning.seed_everything
+    seed: 333
+  - _target_: contrib.drifter_geos.finetune.finetune_training
+    trainer: ${trainer}
+    lit_mod: ${model}
+    dm: ${datamodule}
+
+defaults:
+  - _self_
